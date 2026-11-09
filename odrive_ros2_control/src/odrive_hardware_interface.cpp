@@ -1,4 +1,3 @@
-
 #include "can_helpers.hpp"
 #include "can_simple_messages.hpp"
 #include "hardware_interface/system_interface.hpp"
@@ -7,6 +6,9 @@
 #include "pluginlib/class_list_macros.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "socket_can.hpp"
+#include <cmath>
+
+using namespace std::placeholders;
 
 namespace odrive_ros2_control {
 
@@ -47,14 +49,14 @@ private:
 };
 
 struct Axis {
-    Axis(SocketCanIntf* can_intf, uint32_t node_id) : can_intf_(can_intf), node_id_(node_id) {}
+    Axis(SocketCanIntf* can_intf, uint32_t node_id, double direction = 1.0) 
+        : can_intf_(can_intf), node_id_(node_id), direction_(direction) {}
 
     void on_can_msg(const rclcpp::Time& timestamp, const can_frame& frame);
 
-    void on_can_msg();
-
     SocketCanIntf* can_intf_;
     uint32_t node_id_;
+    double direction_; // Multiplier flag: 1.0 (Normal), -1.0 (Reversed)
 
     // Commands (ros2_control => ODrives)
     double pos_setpoint_ = 0.0f; // [rad]
@@ -62,29 +64,11 @@ struct Axis {
     double torque_setpoint_ = 0.0f; // [Nm]
 
     // State (ODrives => ros2_control)
-    // rclcpp::Time encoder_estimates_timestamp_;
-    // uint32_t axis_error_ = 0;
-    // uint8_t axis_state_ = 0;
-    // uint8_t procedure_result_ = 0;
-    // uint8_t trajectory_done_flag_ = 0;
     double pos_estimate_ = NAN; // [rad]
     double vel_estimate_ = NAN; // [rad/s]
-    // double iq_setpoint_ = NAN;
-    // double iq_measured_ = NAN;
     double torque_target_ = NAN; // [Nm]
     double torque_estimate_ = NAN; // [Nm]
-    // uint32_t active_errors_ = 0;
-    // uint32_t disarm_reason_ = 0;
-    // double fet_temperature_ = NAN;
-    // double motor_temperature_ = NAN;
-    // double bus_voltage_ = NAN;
-    // double bus_current_ = NAN;
 
-    // Indicates which controller inputs are enabled. This is configured by the
-    // controller that sits on top of this hardware interface. Multiple inputs
-    // can be enabled at the same time, in this case the non-primary inputs are
-    // used as feedforward terms.
-    // This implicitly defines the ODrive's control mode.
     bool pos_input_enabled_ = false;
     bool vel_input_enabled_ = false;
     bool torque_input_enabled_ = false;
@@ -103,7 +87,6 @@ struct Axis {
 } // namespace odrive_ros2_control
 
 using namespace odrive_ros2_control;
-
 using hardware_interface::CallbackReturn;
 using hardware_interface::return_type;
 
@@ -115,7 +98,12 @@ CallbackReturn ODriveHardwareInterface::on_init(const hardware_interface::Hardwa
     can_intf_name_ = info_.hardware_parameters["can"];
 
     for (auto& joint : info_.joints) {
-        axes_.emplace_back(&can_intf_, std::stoi(joint.parameters.at("node_id")));
+        double direction = 1.0;
+        auto it = joint.parameters.find("direction");
+        if (it != joint.parameters.end()) {
+            direction = std::stod(it->second);
+        }
+        axes_.emplace_back(&can_intf_, std::stoi(joint.parameters.at("node_id")), direction);
     }
 
     return CallbackReturn::SUCCESS;
@@ -141,26 +129,19 @@ CallbackReturn ODriveHardwareInterface::on_cleanup(const State&) {
 
 CallbackReturn ODriveHardwareInterface::on_activate(const State&) {
     RCLCPP_INFO(rclcpp::get_logger("ODriveHardwareInterface"), "activating ODrives...");
-
-    // This can be called several seconds before the controller finishes starting.
-    // Therefore we enable the ODrives only in perform_command_mode_switch().
-
     active_ = true;
     for (auto& axis : axes_) {
         set_axis_command_mode(axis);
     }
-
     return CallbackReturn::SUCCESS;
 }
 
 CallbackReturn ODriveHardwareInterface::on_deactivate(const State&) {
     RCLCPP_INFO(rclcpp::get_logger("ODriveHardwareInterface"), "deactivating ODrives...");
-
     active_ = false;
     for (auto& axis : axes_) {
         set_axis_command_mode(axis);
     }
-
     return CallbackReturn::SUCCESS;
 }
 
@@ -263,24 +244,21 @@ return_type ODriveHardwareInterface::read(const rclcpp::Time& timestamp, const r
 
 return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Duration&) {
     for (auto& axis : axes_) {
-        // Send the CAN message that fits the set of enabled setpoints
         if (axis.pos_input_enabled_) {
             Set_Input_Pos_msg_t msg;
-            msg.Input_Pos = axis.pos_setpoint_ / (2 * M_PI);
-            msg.Vel_FF = axis.vel_input_enabled_ ? (axis.vel_setpoint_ / (2 * M_PI)) : 0.0f;
-            msg.Torque_FF = axis.torque_input_enabled_ ? axis.torque_setpoint_ : 0.0f;
+            msg.Input_Pos = (axis.pos_setpoint_ * axis.direction_) / (2 * M_PI);
+            msg.Vel_FF = axis.vel_input_enabled_ ? ((axis.vel_setpoint_ * axis.direction_) / (2 * M_PI)) : 0.0f;
+            msg.Torque_FF = axis.torque_input_enabled_ ? (axis.torque_setpoint_ * axis.direction_) : 0.0f;
             axis.send(msg);
         } else if (axis.vel_input_enabled_) {
             Set_Input_Vel_msg_t msg;
-            msg.Input_Vel = axis.vel_setpoint_ / (2 * M_PI);
-            msg.Input_Torque_FF = axis.torque_input_enabled_ ? axis.torque_setpoint_ : 0.0f;
+            msg.Input_Vel = (axis.vel_setpoint_ * axis.direction_) / (2 * M_PI);
+            msg.Input_Torque_FF = axis.torque_input_enabled_ ? (axis.torque_setpoint_ * axis.direction_) : 0.0f;
             axis.send(msg);
         } else if (axis.torque_input_enabled_) {
             Set_Input_Torque_msg_t msg;
-            msg.Input_Torque = axis.torque_setpoint_;
+            msg.Input_Torque = axis.torque_setpoint_ * axis.direction_;
             axis.send(msg);
-        } else {
-            // no control enabled - don't send any setpoint
         }
     }
 
@@ -336,8 +314,8 @@ void ODriveHardwareInterface::set_axis_command_mode(const Axis& axis) {
 void Axis::on_can_msg(const rclcpp::Time&, const can_frame& frame) {
     uint8_t cmd = frame.can_id & 0x1f;
 
-    auto try_decode = [&]<typename TMsg>(TMsg& msg) {
-        if (frame.can_dlc < Get_Encoder_Estimates_msg_t::msg_length) {
+    auto try_decode = [&](auto& msg) {
+        if (frame.can_dlc < std::decay_t<decltype(msg)>::msg_length) {
             RCLCPP_WARN(rclcpp::get_logger("ODriveHardwareInterface"), "message %d too short", cmd);
             return false;
         }
@@ -348,17 +326,18 @@ void Axis::on_can_msg(const rclcpp::Time&, const can_frame& frame) {
     switch (cmd) {
         case Get_Encoder_Estimates_msg_t::cmd_id: {
             if (Get_Encoder_Estimates_msg_t msg; try_decode(msg)) {
-                pos_estimate_ = msg.Pos_Estimate * (2 * M_PI);
-                vel_estimate_ = msg.Vel_Estimate * (2 * M_PI);
+                pos_estimate_ = msg.Pos_Estimate * (2 * M_PI) * direction_;
+                vel_estimate_ = msg.Vel_Estimate * (2 * M_PI) * direction_;
             }
-        } break;
+            break;
+        }
         case Get_Torques_msg_t::cmd_id: {
             if (Get_Torques_msg_t msg; try_decode(msg)) {
-                torque_target_ = msg.Torque_Target;
-                torque_estimate_ = msg.Torque_Estimate;
+                torque_target_ = msg.Torque_Target * direction_;
+                torque_estimate_ = msg.Torque_Estimate * direction_;
             }
-        } break;
-            // silently ignore unimplemented command IDs
+            break;
+        }
     }
 }
 
